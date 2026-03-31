@@ -8,14 +8,12 @@ const { Pool } = pkg;
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ── DB ────────────────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 2,
 });
 
-// ── R2 ────────────────────────────────────────────────────────────────────────
 const r2 = new S3Client({
   region: "auto",
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -26,7 +24,6 @@ const r2 = new S3Client({
 });
 const R2_BUCKET = process.env.R2_BUCKET_NAME || "sitesnap-files";
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 function getContentType(ext: string): string {
   const types: Record<string, string> = {
     ".html": "text/html", ".htm": "text/html", ".css": "text/css",
@@ -46,15 +43,57 @@ function sanitize(str: string): string {
   return String(str).trim().slice(0, 500).replace(/[<>]/g, "");
 }
 
+// ── Rewrite absolute paths to use the site's base URL ────────────────────────
 function rewriteHtml(html: string, base: string): string {
-  html = html.replace(/(<(?:a|link|script|img|form|iframe|source)\s[^>]*(?:href|src|action)=["'])\/(?!\/)([^"']*)(["'])/gi, (_,b,u,a) => `${b}${base}${u}${a}`);
-  html = html.replace(/url\(['"]?\/(?!\/)([^'")]+)['"]?\)/gi, (_,u) => `url('${base}${u}')`);
+  // base = "https://sitesnap-processor.sitesnap-files.workers.dev/sites/uuid/"
+
+  // Helper: rewrite a single URL value
+  const rw = (u: string): string => {
+    if (!u) return u;
+    if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
+    if (u.startsWith("data:") || u.startsWith("mailto:") || u.startsWith("#")) return u;
+    if (u.startsWith("/")) return base + u.slice(1);
+    return u; // relative paths stay as-is
+  };
+
+  // Rewrite src= attributes
+  html = html.replace(/\bsrc=["']([^"']+)["']/gi, (_, u) => `src="${rw(u)}"`);
+
+  // Rewrite href= attributes
+  html = html.replace(/\bhref=["']([^"']+)["']/gi, (_, u) => `href="${rw(u)}"`);
+
+  // Rewrite action= attributes
+  html = html.replace(/\baction=["']([^"']+)["']/gi, (_, u) => `action="${rw(u)}"`);
+
+  // Rewrite srcset= attributes
+  html = html.replace(/\bsrcset=["']([^"']+)["']/gi, (_, srcset) => {
+    const rewritten = srcset.replace(/(^|,\s*)(\S+)/g, (m: string, sep: string, url: string) => {
+      // srcset entries can be "url width" like "/img.png 2x"
+      const parts = url.split(/\s+/);
+      parts[0] = rw(parts[0]);
+      return sep + parts.join(" ");
+    });
+    return `srcset="${rewritten}"`;
+  });
+
+  // Rewrite url() in inline styles
+  html = html.replace(/url\(["']?([^"')]+)["']?\)/gi, (_, u) => `url('${rw(u)}')`);
+
+  // Remove vite HMR
   html = html.replace(/<script[^>]+src=["'][^"']*@vite[^"']*["'][^>]*><\/script>/gi, "");
+
   return html;
 }
 
 function rewriteCss(css: string, base: string): string {
-  return css.replace(/url\(['"]?\/(?!\/)([^'")]+)['"]?\)/gi, (_,u) => `url('${base}${u}')`);
+  const rw = (u: string): string => {
+    if (!u) return u;
+    if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
+    if (u.startsWith("data:")) return u;
+    if (u.startsWith("/")) return base + u.slice(1);
+    return u;
+  };
+  return css.replace(/url\(["']?([^"')]+)["']?\)/gi, (_, u) => `url('${rw(u)}')`);
 }
 
 async function getFromR2(key: string): Promise<Buffer | null> {
@@ -83,14 +122,12 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // ── Process ZIP ───────────────────────────────────────────────────────────────
 app.post("/process", async (req, res) => {
-  // Verify secret
   const secret = req.headers["x-worker-secret"];
   if (secret !== process.env.WORKER_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const { r2Key, fileName, userId, siteId: providedSiteId } = req.body;
-
   if (!r2Key || !fileName || !userId) {
     return res.status(400).json({ error: "Missing required fields" });
   }
@@ -104,7 +141,6 @@ app.post("/process", async (req, res) => {
     if (!zipBuffer) {
       return res.status(400).json({ error: "Upload not found. Please try again." });
     }
-
     console.log(`ZIP size: ${(zipBuffer.length / 1024 / 1024).toFixed(2)}MB`);
 
     // Unzip
@@ -123,18 +159,17 @@ app.post("/process", async (req, res) => {
       return res.status(422).json({ error: "invalid_zip", message: "ZIP is empty." });
     }
 
-    // Validate — find index.html
+    // Find index.html
     const indexKey = keys.find(k => {
       const n = k.toLowerCase();
       return !n.includes("__macosx") && (n === "index.html" || n.endsWith("/index.html"));
     });
-
     if (!indexKey) {
       await deleteFromR2(r2Key);
       return res.status(422).json({ error: "invalid_zip", message: "No index.html found. Export using Simply Static plugin." });
     }
 
-    // Security check - no path traversal
+    // Security check
     for (const key of keys) {
       if (key.includes("../") || key.includes("..\\")) {
         await deleteFromR2(r2Key);
@@ -145,24 +180,25 @@ app.post("/process", async (req, res) => {
     const siteId = providedSiteId || uuidv4();
     const siteName = sanitize(fileName.replace(/\.zip$/i, "") || "Untitled Site");
 
-    // Determine root prefix (some ZIPs have a top-level folder)
+    // Worker URL serves the files
+    const workerUrl = (process.env.WORKER_URL || "").trim().replace(/\/$/, "");
+    const siteUrl = `${workerUrl}/sites/${siteId}/`;
+    const base = siteUrl; // e.g. https://xxx.workers.dev/sites/uuid/
+
+    // Find root prefix
     let rootPrefix = "";
     const parts = indexKey.split("/");
     if (parts.length > 1) rootPrefix = parts.slice(0, -1).join("/") + "/";
 
-    // The Worker URL is still used to SERVE the files
-    const workerUrl = (process.env.WORKER_URL || "").trim().replace(/\/$/, "");
-    const siteUrl = `${workerUrl}/sites/${siteId}/`;
-    const base = siteUrl;
-
-    console.log(`Uploading ${keys.length} files to R2 for site ${siteId}...`);
-
-    // Upload files to R2 in batches of 20
+    // Filter files
     const filesToUpload = keys.filter(k => {
       const n = k.toLowerCase();
       return !n.includes("__macosx") && !k.endsWith("/") && files[k].length > 0;
     });
 
+    console.log(`Uploading ${filesToUpload.length} files to R2...`);
+
+    // Upload in batches of 20
     for (let i = 0; i < filesToUpload.length; i += 20) {
       const batch = filesToUpload.slice(i, i + 20);
       await Promise.all(batch.map(async (key) => {
@@ -174,17 +210,16 @@ app.post("/process", async (req, res) => {
         const ext = relKey.includes(".") ? relKey.substring(relKey.lastIndexOf(".")) : "";
         let fileData: Uint8Array = files[key];
 
-        // Rewrite absolute paths in HTML and CSS
         if (ext === ".html" || ext === ".htm") {
           try {
             const rewritten = rewriteHtml(strFromU8(fileData), base);
             fileData = new TextEncoder().encode(rewritten);
-          } catch {}
+          } catch (e) { console.error("HTML rewrite error:", key, e); }
         } else if (ext === ".css") {
           try {
             const rewritten = rewriteCss(strFromU8(fileData), base);
             fileData = new TextEncoder().encode(rewritten);
-          } catch {}
+          } catch (e) { console.error("CSS rewrite error:", key, e); }
         }
 
         await r2.send(new PutObjectCommand({
@@ -195,26 +230,23 @@ app.post("/process", async (req, res) => {
         }));
       }));
 
-      if (i % 100 === 0) console.log(`Uploaded ${Math.min(i + 20, filesToUpload.length)}/${filesToUpload.length} files`);
+      console.log(`Uploaded ${Math.min(i + 20, filesToUpload.length)}/${filesToUpload.length} files`);
     }
 
-    // Delete the temp ZIP from R2
+    // Delete temp ZIP
     await deleteFromR2(r2Key);
 
-    // Save to database
+    // Save to DB
     await pool.query(
       "INSERT INTO sites (id, user_id, name, url) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET url = $4",
       [siteId, userId, siteName, siteUrl]
     );
 
-    console.log(`Done! Site ${siteId} deployed at ${siteUrl}`);
+    console.log(`Done! Site deployed at ${siteUrl}`);
 
     return res.json({
-      id: siteId,
-      name: siteName,
-      url: siteUrl,
-      completed: true,
-      filesUploaded: filesToUpload.length,
+      id: siteId, name: siteName, url: siteUrl,
+      completed: true, filesUploaded: filesToUpload.length,
     });
 
   } catch (e: any) {
@@ -223,10 +255,7 @@ app.post("/process", async (req, res) => {
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`SiteSnap Processor running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`SiteSnap Processor running on port ${PORT}`));
 
 export default app;
