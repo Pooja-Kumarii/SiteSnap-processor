@@ -203,10 +203,10 @@ app.post("/process", (req, res) => {
 
   console.log(`[${siteId}] Received request, starting background processing...`);
 
-  // ✅ RESPOND IMMEDIATELY — Vercel gets 200 right away
+  // ✅ RESPOND IMMEDIATELY — Vercel gets 200 right awayyyyyyyyyyyyyyyy
   res.json({ status: "processing", siteId });
 
-  // ✅ PROCESS IN BACKGROUND — after response is sent
+  // ✅ PROCESS IN BACKGROUND — after response is senttttttt
   processZip(r2Key, fileName, userId, siteId);
 });
 
