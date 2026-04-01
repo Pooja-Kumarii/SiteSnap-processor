@@ -43,45 +43,27 @@ function sanitize(str: string): string {
   return String(str).trim().slice(0, 500).replace(/[<>]/g, "");
 }
 
-// ── Rewrite absolute paths to use the site's base URL ────────────────────────
 function rewriteHtml(html: string, base: string): string {
-  // base = "https://sitesnap-processor.sitesnap-files.workers.dev/sites/uuid/"
-
-  // Helper: rewrite a single URL value
   const rw = (u: string): string => {
     if (!u) return u;
     if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
     if (u.startsWith("data:") || u.startsWith("mailto:") || u.startsWith("#")) return u;
     if (u.startsWith("/")) return base + u.slice(1);
-    return u; // relative paths stay as-is
+    return u;
   };
-
-  // Rewrite src= attributes
   html = html.replace(/\bsrc=["']([^"']+)["']/gi, (_, u) => `src="${rw(u)}"`);
-
-  // Rewrite href= attributes
   html = html.replace(/\bhref=["']([^"']+)["']/gi, (_, u) => `href="${rw(u)}"`);
-
-  // Rewrite action= attributes
   html = html.replace(/\baction=["']([^"']+)["']/gi, (_, u) => `action="${rw(u)}"`);
-
-  // Rewrite srcset= attributes
   html = html.replace(/\bsrcset=["']([^"']+)["']/gi, (_, srcset) => {
     const rewritten = srcset.replace(/(^|,\s*)(\S+)/g, (m: string, sep: string, url: string) => {
-      // srcset entries can be "url width" like "/img.png 2x"
       const parts = url.split(/\s+/);
       parts[0] = rw(parts[0]);
       return sep + parts.join(" ");
     });
     return `srcset="${rewritten}"`;
   });
-
-  // Rewrite url() in inline styles
   html = html.replace(/url\(["']?([^"')]+)["']?\)/gi, (_, u) => `url('${rw(u)}')`);
-
-  // Remove vite HMR
   html = html.replace(/<script[^>]+src=["'][^"']*@vite[^"']*["'][^>]*><\/script>/gi, "");
-
   return html;
 }
 
@@ -116,89 +98,50 @@ async function deleteFromR2(prefix: string) {
   } catch (e) { console.error("R2 delete error:", e); }
 }
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get("/", (_req, res) => res.json({ status: "ok", service: "SiteSnap Processor" }));
-app.get("/health", (_req, res) => res.json({ status: "ok" }));
-
-// ── Process ZIP ───────────────────────────────────────────────────────────────
-app.post("/process", async (req, res) => {
-  const secret = req.headers["x-worker-secret"];
-  if (secret !== process.env.WORKER_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  const { r2Key, fileName, userId, siteId: providedSiteId } = req.body;
-  if (!r2Key || !fileName || !userId) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-
-  console.log(`Processing: ${fileName} for user ${userId}`);
-
+// ── The actual processing function ───────────────────────────────────────────
+async function processZip(r2Key: string, fileName: string, userId: string, siteId: string) {
   try {
-    // Download ZIP from R2
-    console.log(`Downloading from R2: ${r2Key}`);
+    console.log(`[${siteId}] Downloading ZIP from R2: ${r2Key}`);
     const zipBuffer = await getFromR2(r2Key);
-    if (!zipBuffer) {
-      return res.status(400).json({ error: "Upload not found. Please try again." });
-    }
-    console.log(`ZIP size: ${(zipBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+    if (!zipBuffer) { console.error(`[${siteId}] ZIP not found in R2`); return; }
 
-    // Unzip
+    console.log(`[${siteId}] ZIP size: ${(zipBuffer.length / 1024 / 1024).toFixed(2)}MB`);
+
     const zipData = new Uint8Array(zipBuffer);
     let files: Record<string, Uint8Array>;
     try {
       files = unzipSync(zipData);
     } catch (e) {
+      console.error(`[${siteId}] Could not unzip:`, e);
       await deleteFromR2(r2Key);
-      return res.status(422).json({ error: "invalid_zip", message: "Could not read ZIP file." });
+      return;
     }
 
     const keys = Object.keys(files);
-    if (!keys.length) {
-      await deleteFromR2(r2Key);
-      return res.status(422).json({ error: "invalid_zip", message: "ZIP is empty." });
-    }
+    if (!keys.length) { console.error(`[${siteId}] ZIP is empty`); return; }
 
-    // Find index.html
     const indexKey = keys.find(k => {
       const n = k.toLowerCase();
       return !n.includes("__macosx") && (n === "index.html" || n.endsWith("/index.html"));
     });
-    if (!indexKey) {
-      await deleteFromR2(r2Key);
-      return res.status(422).json({ error: "invalid_zip", message: "No index.html found. Export using Simply Static plugin." });
-    }
+    if (!indexKey) { console.error(`[${siteId}] No index.html found`); await deleteFromR2(r2Key); return; }
 
-    // Security check
-    for (const key of keys) {
-      if (key.includes("../") || key.includes("..\\")) {
-        await deleteFromR2(r2Key);
-        return res.status(422).json({ error: "invalid_zip", message: "Invalid ZIP: unsafe paths." });
-      }
-    }
-
-    const siteId = providedSiteId || uuidv4();
     const siteName = sanitize(fileName.replace(/\.zip$/i, "") || "Untitled Site");
-
-    // Worker URL serves the files
     const workerUrl = (process.env.WORKER_URL || "").trim().replace(/\/$/, "");
     const siteUrl = `${workerUrl}/sites/${siteId}/`;
-    const base = siteUrl; // e.g. https://xxx.workers.dev/sites/uuid/
+    const base = siteUrl;
 
-    // Find root prefix
     let rootPrefix = "";
     const parts = indexKey.split("/");
     if (parts.length > 1) rootPrefix = parts.slice(0, -1).join("/") + "/";
 
-    // Filter files
     const filesToUpload = keys.filter(k => {
       const n = k.toLowerCase();
       return !n.includes("__macosx") && !k.endsWith("/") && files[k].length > 0;
     });
 
-    console.log(`Uploading ${filesToUpload.length} files to R2...`);
+    console.log(`[${siteId}] Uploading ${filesToUpload.length} files to R2...`);
 
-    // Upload in batches of 20
     for (let i = 0; i < filesToUpload.length; i += 20) {
       const batch = filesToUpload.slice(i, i + 20);
       await Promise.all(batch.map(async (key) => {
@@ -211,48 +154,60 @@ app.post("/process", async (req, res) => {
         let fileData: Uint8Array = files[key];
 
         if (ext === ".html" || ext === ".htm") {
-          try {
-            const rewritten = rewriteHtml(strFromU8(fileData), base);
-            fileData = new TextEncoder().encode(rewritten);
-          } catch (e) { console.error("HTML rewrite error:", key, e); }
+          try { fileData = new TextEncoder().encode(rewriteHtml(strFromU8(fileData), base)); } catch {}
         } else if (ext === ".css") {
-          try {
-            const rewritten = rewriteCss(strFromU8(fileData), base);
-            fileData = new TextEncoder().encode(rewritten);
-          } catch (e) { console.error("CSS rewrite error:", key, e); }
+          try { fileData = new TextEncoder().encode(rewriteCss(strFromU8(fileData), base)); } catch {}
         }
 
         await r2.send(new PutObjectCommand({
-          Bucket: R2_BUCKET,
-          Key: r2FileKey,
-          Body: fileData,
+          Bucket: R2_BUCKET, Key: r2FileKey, Body: fileData,
           ContentType: getContentType(ext),
         }));
       }));
 
-      console.log(`Uploaded ${Math.min(i + 20, filesToUpload.length)}/${filesToUpload.length} files`);
+      if ((i + 20) % 200 === 0 || i + 20 >= filesToUpload.length) {
+        console.log(`[${siteId}] Uploaded ${Math.min(i + 20, filesToUpload.length)}/${filesToUpload.length}`);
+      }
     }
 
-    // Delete temp ZIP
     await deleteFromR2(r2Key);
 
-    // Save to DB
     await pool.query(
       "INSERT INTO sites (id, user_id, name, url) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET url = $4",
       [siteId, userId, siteName, siteUrl]
     );
 
-    console.log(`Done! Site deployed at ${siteUrl}`);
-
-    return res.json({
-      id: siteId, name: siteName, url: siteUrl,
-      completed: true, filesUploaded: filesToUpload.length,
-    });
-
+    console.log(`[${siteId}] Done! Deployed at ${siteUrl}`);
   } catch (e: any) {
-    console.error("Processing error:", e);
-    return res.status(500).json({ error: "Processing failed: " + e.message });
+    console.error(`[${siteId}] Processing error:`, e.message);
   }
+}
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => res.json({ status: "ok", service: "SiteSnap Processor" }));
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+// ── Process ZIP ── RESPONDS IMMEDIATELY then processes in background ───────────
+app.post("/process", (req, res) => {
+  const secret = req.headers["x-worker-secret"];
+  if (secret !== process.env.WORKER_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { r2Key, fileName, userId, siteId: providedSiteId } = req.body;
+  if (!r2Key || !fileName || !userId) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  const siteId = providedSiteId || uuidv4();
+
+  console.log(`[${siteId}] Received request, starting background processing...`);
+
+  // ✅ RESPOND IMMEDIATELY — Vercel gets 200 right away
+  res.json({ status: "processing", siteId });
+
+  // ✅ PROCESS IN BACKGROUND — after response is sent
+  processZip(r2Key, fileName, userId, siteId);
 });
 
 const PORT = process.env.PORT || 3001;
