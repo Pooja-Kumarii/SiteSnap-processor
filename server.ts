@@ -45,24 +45,39 @@ function sanitize(str: string): string {
 
 function rewriteHtml(html: string, base: string): string {
   const rw = (u: string): string => {
-    if (!u) return u;
+    if (!u || u.length > 500) return u;
     if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
-    if (u.startsWith("data:") || u.startsWith("mailto:") || u.startsWith("#")) return u;
+    if (u.startsWith("data:") || u.startsWith("mailto:") || u.startsWith("#") || u.startsWith("javascript:")) return u;
     if (u.startsWith("/")) return base + u.slice(1);
     return u;
   };
-  html = html.replace(/\bsrc=["']([^"']+)["']/gi, (_, u) => `src="${rw(u)}"`);
-  html = html.replace(/\bhref=["']([^"']+)["']/gi, (_, u) => `href="${rw(u)}"`);
-  html = html.replace(/\baction=["']([^"']+)["']/gi, (_, u) => `action="${rw(u)}"`);
-  html = html.replace(/\bsrcset=["']([^"']+)["']/gi, (_, srcset) => {
-    const rewritten = srcset.replace(/(^|,\s*)(\S+)/g, (m: string, sep: string, url: string) => {
-      const parts = url.split(/\s+/);
-      parts[0] = rw(parts[0]);
-      return sep + parts.join(" ");
-    });
-    return `srcset="${rewritten}"`;
+  // Only rewrite HTML tag attributes — not inside script content
+  // Split by <script> blocks to avoid rewriting JS code
+  const parts = html.split(/(<script[\s\S]*?<\/script>)/gi);
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].toLowerCase().startsWith("<script")) continue; // skip script blocks
+    parts[i] = parts[i]
+      .replace(/(<img[^>]*?\s)src=["']([^"']+)["']/gi, (_, pre, u) => `${pre}src="${rw(u)}"`)
+      .replace(/(<source[^>]*?\s)src=["']([^"']+)["']/gi, (_, pre, u) => `${pre}src="${rw(u)}"`)
+      .replace(/(<link[^>]*?\s)href=["']([^"']+)["']/gi, (_, pre, u) => `${pre}href="${rw(u)}"`)
+      .replace(/(<script[^>]*?\s)src=["']([^"']+)["']/gi, (_, pre, u) => `${pre}src="${rw(u)}"`)
+      .replace(/(<a[^>]*?\s)href=["']([^"'#][^"']*)["']/gi, (_, pre, u) => `${pre}href="${rw(u)}"`)
+      .replace(/(<form[^>]*?\s)action=["']([^"']+)["']/gi, (_, pre, u) => `${pre}action="${rw(u)}"`)
+      .replace(/(<img[^>]*?\s)srcset=["']([^"']+)["']/gi, (_, pre, srcset) => {
+        const rewritten = srcset.replace(/(^|,\s*)(\S+)/g, (m: string, sep: string, url: string) => {
+          const pts = url.split(/\s+/); pts[0] = rw(pts[0]); return sep + pts.join(" ");
+        });
+        return `${pre}srcset="${rewritten}"`;
+      });
+  }
+  html = parts.join("");
+  // Rewrite url() in style tags only
+  html = html.replace(/(<style[\s\S]*?<\/style>)/gi, (styleBlock) => {
+    return styleBlock.replace(/url\(["']?([^"')\s]+)["']?\)/gi, (_, u) => `url('${rw(u)}')`);
   });
-  html = html.replace(/url\(["']?([^"')]+)["']?\)/gi, (_, u) => `url('${rw(u)}')`);
+  // Rewrite inline style attributes
+  html = html.replace(/(style=["'][^"']*url\()["']?(\/[^"')\s]+)["']?/gi, (_, pre, u) => `${pre}'${rw(u)}'`);
+  // Remove vite HMR
   html = html.replace(/<script[^>]+src=["'][^"']*@vite[^"']*["'][^>]*><\/script>/gi, "");
   return html;
 }
@@ -203,10 +218,10 @@ app.post("/process", (req, res) => {
 
   console.log(`[${siteId}] Received request, starting background processing...`);
 
-  // ✅ RESPOND IMMEDIATELY — Vercel gets 200 right awayyyyyyyyyyyyyyyy
+  // ✅ RESPOND IMMEDIATELY — Vercel gets 200 right away
   res.json({ status: "processing", siteId });
 
-  // ✅ PROCESS IN BACKGROUND — after response is senttttttt
+  // ✅ PROCESS IN BACKGROUND — after response is sent
   processZip(r2Key, fileName, userId, siteId);
 });
 
