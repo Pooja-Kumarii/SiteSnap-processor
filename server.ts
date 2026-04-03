@@ -43,11 +43,21 @@ function sanitize(str: string): string {
   return String(str).trim().slice(0, 500).replace(/[<>]/g, "");
 }
 
-function rewriteHtml(html: string, base: string): string {
+function rewriteHtml(html: string, base: string, localUrl?: string): string {
   const rw = (u: string): string => {
     if (!u || u.length > 500) return u;
-    if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
     if (u.startsWith("data:") || u.startsWith("mailto:") || u.startsWith("#") || u.startsWith("javascript:")) return u;
+    // Replace localhost URLs with the base Worker URL
+    if (localUrl && u.startsWith(localUrl)) return base + u.slice(localUrl.length).replace(/^\//, "");
+    if (u.includes("localhost") || u.includes("127.0.0.1")) {
+      // Extract just the path part after the host
+      try {
+        const parsed = new URL(u);
+        const path = parsed.pathname.replace(/^\//, "");
+        return base + path + (parsed.search || "");
+      } catch { return u; }
+    }
+    if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
     if (u.startsWith("/")) return base + u.slice(1);
     return u;
   };
@@ -85,8 +95,11 @@ function rewriteHtml(html: string, base: string): string {
 function rewriteCss(css: string, base: string): string {
   const rw = (u: string): string => {
     if (!u) return u;
-    if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
     if (u.startsWith("data:")) return u;
+    if (u.includes("localhost") || u.includes("127.0.0.1")) {
+      try { const parsed = new URL(u); return base + parsed.pathname.replace(/^\//, ""); } catch { return u; }
+    }
+    if (u.startsWith("//") || u.startsWith("http://") || u.startsWith("https://")) return u;
     if (u.startsWith("/")) return base + u.slice(1);
     return u;
   };
@@ -146,6 +159,20 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
     const siteUrl = `${workerUrl}/sites/${siteId}/`;
     const base = siteUrl;
 
+    // Detect the local WordPress URL from index.html content
+    let localUrl = "";
+    try {
+      const indexData = files[indexKey];
+      const indexHtml = strFromU8(indexData).substring(0, 2000);
+      const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)[^"'\s]*/i);
+      if (match) {
+        const u = new URL(match[0]);
+        localUrl = u.origin + u.pathname.split("/").slice(0, -1).join("/");
+        if (!localUrl.endsWith("/")) localUrl += "/";
+        console.log(`[${siteId}] Detected local WordPress URL: ${localUrl}`);
+      }
+    } catch {}
+
     let rootPrefix = "";
     const parts = indexKey.split("/");
     if (parts.length > 1) rootPrefix = parts.slice(0, -1).join("/") + "/";
@@ -169,7 +196,7 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
         let fileData: Uint8Array = files[key];
 
         if (ext === ".html" || ext === ".htm") {
-          try { fileData = new TextEncoder().encode(rewriteHtml(strFromU8(fileData), base)); } catch {}
+          try { fileData = new TextEncoder().encode(rewriteHtml(strFromU8(fileData), base, localUrl)); } catch {}
         } else if (ext === ".css") {
           try { fileData = new TextEncoder().encode(rewriteCss(strFromU8(fileData), base)); } catch {}
         }
