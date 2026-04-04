@@ -136,6 +136,9 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
     console.log(`[${siteId}] ZIP size: ${(zipBuffer.length / 1024 / 1024).toFixed(2)}MB`);
 
     const zipData = new Uint8Array(zipBuffer);
+    // Free original buffer immediately to save RAM
+    (zipBuffer as any) = undefined;
+
     let files: Record<string, Uint8Array>;
     try {
       files = unzipSync(zipData);
@@ -144,6 +147,8 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
       await deleteFromR2(r2Key);
       return;
     }
+    // Free zipData after extraction to save RAM
+    (zipData as any) = undefined;
 
     const keys = Object.keys(files);
     if (!keys.length) { console.error(`[${siteId}] ZIP is empty`); return; }
@@ -159,17 +164,27 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
     const siteUrl = `${workerUrl}/sites/${siteId}/`;
     const base = siteUrl;
 
-    // Detect the local WordPress URL from index.html content
+    // Detect the source URL from index.html (localhost OR placeholder)
     let localUrl = "";
     try {
       const indexData = files[indexKey];
-      const indexHtml = strFromU8(indexData).substring(0, 2000);
-      const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)[^"'\s]*/i);
-      if (match) {
-        const u = new URL(match[0]);
-        localUrl = u.origin + u.pathname.split("/").slice(0, -1).join("/");
-        if (!localUrl.endsWith("/")) localUrl += "/";
-        console.log(`[${siteId}] Detected local WordPress URL: ${localUrl}`);
+      const indexHtml = strFromU8(indexData).substring(0, 3000);
+      // Check for placeholder URL first
+      const placeholderMatch = indexHtml.match(/https?:\/\/sitesnap\.replace\.me[^"'\s]*/i);
+      if (placeholderMatch) {
+        localUrl = "https://sitesnap.replace.me/";
+        console.log(`[${siteId}] Detected placeholder URL: ${localUrl}`);
+      } else {
+        // Fall back to detecting localhost URL
+        const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)[^"'\s]*/i);
+        if (match) {
+          const u = new URL(match[0]);
+          // Get base path (e.g. localhost/newsite/wordpress/)
+          const pathParts = u.pathname.split("/").filter(Boolean);
+          localUrl = u.origin + "/" + pathParts.slice(0, -1).join("/");
+          if (!localUrl.endsWith("/")) localUrl += "/";
+          console.log(`[${siteId}] Detected local WordPress URL: ${localUrl}`);
+        }
       }
     } catch {}
 
@@ -184,8 +199,8 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
 
     console.log(`[${siteId}] Uploading ${filesToUpload.length} files to R2...`);
 
-    for (let i = 0; i < filesToUpload.length; i += 20) {
-      const batch = filesToUpload.slice(i, i + 20);
+    for (let i = 0; i < filesToUpload.length; i += 5) {
+      const batch = filesToUpload.slice(i, i + 5);
       await Promise.all(batch.map(async (key) => {
         let relKey = key;
         if (rootPrefix && relKey.startsWith(rootPrefix)) relKey = relKey.slice(rootPrefix.length);
@@ -205,10 +220,12 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
           Bucket: R2_BUCKET, Key: r2FileKey, Body: fileData,
           ContentType: getContentType(ext),
         }));
+        // Free memory after upload
+        (files[key] as any) = null;
       }));
 
-      if ((i + 20) % 200 === 0 || i + 20 >= filesToUpload.length) {
-        console.log(`[${siteId}] Uploaded ${Math.min(i + 20, filesToUpload.length)}/${filesToUpload.length}`);
+      if ((i + 5) % 100 === 0 || i + 5 >= filesToUpload.length) {
+        console.log(`[${siteId}] Uploaded ${Math.min(i + 5, filesToUpload.length)}/${filesToUpload.length}`);
       }
     }
 
