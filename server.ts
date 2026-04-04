@@ -47,10 +47,13 @@ function rewriteHtml(html: string, base: string, localUrl?: string): string {
   const rw = (u: string): string => {
     if (!u || u.length > 500) return u;
     if (u.startsWith("data:") || u.startsWith("mailto:") || u.startsWith("#") || u.startsWith("javascript:")) return u;
-    // Replace localhost URLs with the base Worker URL
-    if (localUrl && u.startsWith(localUrl)) return base + u.slice(localUrl.length).replace(/^\//, "");
+    // Replace placeholder URL
+    if (u.includes("sitesnap.replace.me")) {
+      const path = u.replace(/https?:\/\/sitesnap\.replace\.me\//, "").replace(/https?:\/\/sitesnap\.replace\.me/, "");
+      return base + path;
+    }
+    // Replace localhost URLs
     if (u.includes("localhost") || u.includes("127.0.0.1")) {
-      // Extract just the path part after the host
       try {
         const parsed = new URL(u);
         const path = parsed.pathname.replace(/^\//, "");
@@ -164,26 +167,24 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
     const siteUrl = `${workerUrl}/sites/${siteId}/`;
     const base = siteUrl;
 
-    // Detect the source URL from index.html (localhost OR placeholder)
+    // Detect source URL — placeholder or localhost
     let localUrl = "";
+    let usePlaceholder = false;
     try {
       const indexData = files[indexKey];
       const indexHtml = strFromU8(indexData).substring(0, 3000);
-      // Check for placeholder URL first
-      const placeholderMatch = indexHtml.match(/https?:\/\/sitesnap\.replace\.me[^"'\s]*/i);
-      if (placeholderMatch) {
-        localUrl = "https://sitesnap.replace.me/";
-        console.log(`[${siteId}] Detected placeholder URL: ${localUrl}`);
+      if (indexHtml.includes("sitesnap.replace.me")) {
+        localUrl = "https://sitesnap.replace.me";
+        usePlaceholder = true;
+        console.log(`[${siteId}] Using placeholder URL replacement`);
       } else {
-        // Fall back to detecting localhost URL
-        const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)[^"'\s]*/i);
+        const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)(:[0-9]+)?(\/[^"'\s<]*)?/i);
         if (match) {
           const u = new URL(match[0]);
-          // Get base path (e.g. localhost/newsite/wordpress/)
           const pathParts = u.pathname.split("/").filter(Boolean);
-          localUrl = u.origin + "/" + pathParts.slice(0, -1).join("/");
+          localUrl = u.origin + (pathParts.length > 1 ? "/" + pathParts.slice(0, -1).join("/") : "");
           if (!localUrl.endsWith("/")) localUrl += "/";
-          console.log(`[${siteId}] Detected local WordPress URL: ${localUrl}`);
+          console.log(`[${siteId}] Detected local URL: ${localUrl}`);
         }
       }
     } catch {}
@@ -211,9 +212,33 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
         let fileData: Uint8Array = files[key];
 
         if (ext === ".html" || ext === ".htm") {
-          try { fileData = new TextEncoder().encode(rewriteHtml(strFromU8(fileData), base, localUrl)); } catch {}
+          try {
+            let html = strFromU8(fileData);
+            // Direct string replacement of placeholder — catches ALL occurrences including query strings
+            if (usePlaceholder) {
+              html = html.split("https://sitesnap.replace.me/").join(base);
+              html = html.split("https://sitesnap.replace.me").join(base.replace(/\/$/, ""));
+            }
+            fileData = new TextEncoder().encode(rewriteHtml(html, base, localUrl));
+          } catch {}
         } else if (ext === ".css") {
-          try { fileData = new TextEncoder().encode(rewriteCss(strFromU8(fileData), base)); } catch {}
+          try {
+            let css = strFromU8(fileData);
+            if (usePlaceholder) {
+              css = css.split("https://sitesnap.replace.me/").join(base);
+              css = css.split("https://sitesnap.replace.me").join(base.replace(/\/$/, ""));
+            }
+            fileData = new TextEncoder().encode(rewriteCss(css, base));
+          } catch {}
+        } else if (ext === ".js" || ext === ".mjs") {
+          try {
+            let js = strFromU8(fileData);
+            if (usePlaceholder && js.includes("sitesnap.replace.me")) {
+              js = js.split("https://sitesnap.replace.me/").join(base);
+              js = js.split("https://sitesnap.replace.me").join(base.replace(/\/$/, ""));
+              fileData = new TextEncoder().encode(js);
+            }
+          } catch {}
         }
 
         await r2.send(new PutObjectCommand({
