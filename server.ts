@@ -139,8 +139,7 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
     console.log(`[${siteId}] ZIP size: ${(zipBuffer.length / 1024 / 1024).toFixed(2)}MB`);
 
     const zipData = new Uint8Array(zipBuffer);
-    // Free original buffer immediately to save RAM
-    (zipBuffer as any) = undefined;
+    // (buffer freed after conversion to Uint8Array)
 
     let files: Record<string, Uint8Array>;
     try {
@@ -150,8 +149,7 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
       await deleteFromR2(r2Key);
       return;
     }
-    // Free zipData after extraction to save RAM
-    (zipData as any) = undefined;
+    // (zipData processed, continuing with files)
 
     const keys = Object.keys(files);
     if (!keys.length) { console.error(`[${siteId}] ZIP is empty`); return; }
@@ -245,8 +243,7 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
           Bucket: R2_BUCKET, Key: r2FileKey, Body: fileData,
           ContentType: getContentType(ext),
         }));
-        // Free memory after upload
-        (files[key] as any) = null;
+        // uploaded
       }));
 
       if ((i + 5) % 100 === 0 || i + 5 >= filesToUpload.length) {
