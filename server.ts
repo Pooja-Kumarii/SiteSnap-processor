@@ -170,19 +170,35 @@ async function processZip(r2Key: string, fileName: string, userId: string, siteI
     let usePlaceholder = false;
     try {
       const indexData = files[indexKey];
-      const indexHtml = strFromU8(indexData).substring(0, 3000);
+      const indexHtml = strFromU8(indexData);
+
       if (indexHtml.includes("sitesnap.replace.me")) {
         localUrl = "https://sitesnap.replace.me";
         usePlaceholder = true;
-        console.log(`[${siteId}] Using placeholder URL replacement`);
+        console.log(`[${siteId}] Detected placeholder in index.html`);
       } else {
-        const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)(:[0-9]+)?(\/[^"'\s<]*)?/i);
-        if (match) {
-          const u = new URL(match[0]);
-          const pathParts = u.pathname.split("/").filter(Boolean);
-          localUrl = u.origin + (pathParts.length > 1 ? "/" + pathParts.slice(0, -1).join("/") : "");
-          if (!localUrl.endsWith("/")) localUrl += "/";
-          console.log(`[${siteId}] Detected local URL: ${localUrl}`);
+        // Check a few CSS/JS files too in case index.html doesn't have it
+        const sampleKeys = keys.filter(k => k.endsWith(".css") || k.endsWith(".js")).slice(0, 5);
+        for (const sk of sampleKeys) {
+          try {
+            const sample = strFromU8(files[sk]).substring(0, 500);
+            if (sample.includes("sitesnap.replace.me")) {
+              usePlaceholder = true;
+              localUrl = "https://sitesnap.replace.me";
+              console.log(`[${siteId}] Detected placeholder in ${sk}`);
+              break;
+            }
+          } catch {}
+        }
+        if (!usePlaceholder) {
+          const match = indexHtml.match(/https?:\/\/(localhost|127\.0\.0\.1)(:[0-9]+)?(\/[^"'\s<]*)?/i);
+          if (match) {
+            const u = new URL(match[0]);
+            const pathParts = u.pathname.split("/").filter(Boolean);
+            localUrl = u.origin + (pathParts.length > 1 ? "/" + pathParts.slice(0, -1).join("/") : "");
+            if (!localUrl.endsWith("/")) localUrl += "/";
+            console.log(`[${siteId}] Detected local URL: ${localUrl}`);
+          }
         }
       }
     } catch {}
